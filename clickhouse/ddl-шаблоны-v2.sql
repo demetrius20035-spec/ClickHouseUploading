@@ -128,13 +128,16 @@ FROM mega.registr_nakopleniya_prodazhi;
 --    делает экспортная функция КХ_ЗачиститьФантомыРегистра(ИмяТаблицы).
 -- ----------------------------------------------------------------------------
 
+-- Оконные функции в HAVING в ClickHouse запрещены (допустимы только в SELECT/ORDER BY),
+-- поэтому «не максимальная версия регистратора» выражается через NOT IN по парам
+-- (registrator, max(_version)). Подзапрос вычисляется один раз в момент постановки
+-- мутации; куски, вставленные позже, не затрагиваются.
 ALTER TABLE mega.registr_nakopleniya_prodazhi_v2
-DELETE WHERE (registrator, _version) IN
+DELETE WHERE (registrator, _version) NOT IN
 (
-    SELECT registrator, _version
+    SELECT registrator, max(_version)
     FROM mega.registr_nakopleniya_prodazhi_v2
-    GROUP BY registrator, _version
-    HAVING _version < max(_version) OVER (PARTITION BY registrator)
+    GROUP BY registrator
 )
 SETTINGS mutations_sync = 0;
 
