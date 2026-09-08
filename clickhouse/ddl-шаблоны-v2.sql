@@ -7,6 +7,8 @@
 --   табличные части:      mega.dokument_<имя>_<тч>_v2   (и spravochnik_... аналогично)
 --   справочники:          mega.spravochnik_<имя>_v2
 --   регистры накопления:  mega.registr_nakopleniya_<имя>_v2
+--   регистры сведений:    mega.registr_svedeniy_<имя>_v2
+--   коммиты снапшотов:    mega.vygruzka_commits_v2      (одна на всю схему, см. 1.5)
 --
 -- В каждую таблицу добавляются два служебных поля:
 --   _version    UInt64 — версия строки (мс универсального времени начала прогона);
@@ -72,6 +74,52 @@ ENGINE = ReplacingMergeTree(_version)
 ORDER BY (registrator, nomer_stroki)
 PARTITION BY toYYYYMM(period);
 
+-- 1.4. Регистр сведений, ПОДЧИНЁННЫЙ РЕГИСТРАТОРУ: полностью аналогичен регистру
+--      накопления (модуль выгружает его той же механикой — регистраторами целиком,
+--      с надгробиями). Дополнительно приходят стандартные поля aktivnost и, у
+--      периодических регистров, period; у непериодических колонки period нет.
+CREATE TABLE mega.registr_svedeniy_tseny_nomenklatury_v2
+(
+    registrator    String,
+    period         DateTime,     -- только у периодических регистров
+    nomer_stroki   UInt32,
+    aktivnost      UInt8,
+    -- ... измерения, ресурсы, реквизиты ...
+    _version       UInt64,
+    _is_deleted    UInt8 DEFAULT 0
+)
+ENGINE = ReplacingMergeTree(_version)
+ORDER BY (registrator, nomer_stroki);
+-- чтение — view по max-версии регистратора, как 2.3
+
+-- 1.5. НЕЗАВИСИМЫЙ регистр сведений: у записей нет надёжного признака изменения
+--      (пишутся напрямую, без документа), поэтому модуль ежедневно заливает ПОЛНЫЙ
+--      снапшот одной версией, а после успешной заливки всех пачек вставляет
+--      строку-коммит в mega.vygruzka_commits_v2. Представление читает только
+--      последнюю закоммиченную версию — оборванный на середине снапшот невидим.
+CREATE TABLE mega.vygruzka_commits_v2
+(
+    tablitsa    String,          -- полное имя таблицы, как его собирает модуль: 'mega.<имя>_v2'
+    _version    UInt64,
+    _is_deleted UInt8 DEFAULT 0  -- не используется; для единообразия JSON модуля
+)
+ENGINE = ReplacingMergeTree(_version)
+ORDER BY (tablitsa, _version);
+
+CREATE TABLE mega.registr_svedeniy_kursy_valyut_v2
+(
+    period      DateTime,        -- только у периодических регистров
+    valyuta     String,
+    -- ... остальные измерения, ресурсы, реквизиты ...
+    _version    UInt64,
+    _is_deleted UInt8 DEFAULT 0
+)
+ENGINE = ReplacingMergeTree(_version)
+ORDER BY (valyuta, period);
+-- Ключ сортировки = все измерения (+ period у периодических) — уникальный ключ записи
+-- в 1С; Nullable у ключевых колонок снять. Регистру без измерений (одна запись
+-- настроек) подойдёт ORDER BY tuple().
+
 
 -- ----------------------------------------------------------------------------
 -- 2. ПРЕДСТАВЛЕНИЯ ДЛЯ ЧТЕНИЯ (ловушка FINAL — поправка Ф-03)
@@ -110,6 +158,16 @@ INNER JOIN
 ) AS last ON r.registrator = last.registrator AND r._version = last.v
 WHERE r._is_deleted = 0;
 
+-- 2.4. Независимый регистр сведений: только последняя ЗАКОММИЧЕННАЯ версия снапшота.
+--      Скалярный подзапрос по таблице коммитов; фильтр по полному имени таблицы.
+CREATE VIEW mega.v_registr_svedeniy_kursy_valyut AS
+SELECT r.*
+FROM mega.registr_svedeniy_kursy_valyut_v2 AS r
+WHERE r._version = (
+    SELECT max(_version) FROM mega.vygruzka_commits_v2
+    WHERE tablitsa = 'mega.registr_svedeniy_kursy_valyut_v2'
+) AND r._is_deleted = 0;
+
 
 -- ----------------------------------------------------------------------------
 -- 3. ПЕРВИЧНОЕ НАПОЛНЕНИЕ ИЗ СТАРЫХ ТАБЛИЦ
@@ -144,6 +202,16 @@ SETTINGS mutations_sync = 0;
 -- Дополнительно: периодический OPTIMIZE схлопывает дубли одинаковых ключей
 -- (замещённые версии), не трогая фантомы с разными ключами:
 -- OPTIMIZE TABLE mega.registr_nakopleniya_prodazhi_v2 FINAL;
+
+-- Снапшоты независимых регистров сведений: удаляются версии СТРОГО МЕНЬШЕ последней
+-- закоммиченной (идущая сейчас заливка с большей версией не затрагивается) — из 1С
+-- это делает экспортная функция КХ_ЗачиститьФантомыСнапшота(ИмяТаблицы).
+ALTER TABLE mega.registr_svedeniy_kursy_valyut_v2
+DELETE WHERE _version < (
+    SELECT max(_version) FROM mega.vygruzka_commits_v2
+    WHERE tablitsa = 'mega.registr_svedeniy_kursy_valyut_v2'
+)
+SETTINGS mutations_sync = 0;
 
 
 -- ----------------------------------------------------------------------------
